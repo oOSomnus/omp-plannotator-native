@@ -1,0 +1,11 @@
+{
+  "name": "omp-plannotator-native",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "bun test ./index.test.ts"
+  },
+  "devDependencies": {
+    "@oh-my-pi/pi-coding-agent": "18.12.6"
+  }
+}
