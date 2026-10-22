@@ -1,7 +1,13 @@
 {
   "name": "omp-plannotator-native",
+  "version": "0.1.0",
   "private": true,
+  "description": "Bridges omp native plan approval to the Plannotator browser review.",
   "type": "module",
+  "omp": {
+    "description": "Bridges omp native plan approval to the Plannotator browser review.",
+    "extensions": ["index.ts"]
+  },
   "scripts": {
     "test": "bun test ./index.test.ts"
   },

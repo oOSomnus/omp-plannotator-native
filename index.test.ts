@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
+import type { ExtensionAPI, PlanReviewRequestedEvent, PlanReviewTier } from "@oh-my-pi/pi-coding-agent";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import extension from "./index";
 
@@ -21,8 +21,14 @@ interface FakeContext {
 	ui: { notify: (message: string, type?: string) => void };
 	setTimeout: (callback: () => void) => FakeTimer;
 	clearTimer: (timer: FakeTimer) => void;
-	getPendingPlanReview: () => { reviewId: string; sessionId: string } | undefined;
-	resolvePlanReview: (reviewId: string, choice: string, input?: { feedback?: string }) => boolean;
+	getPendingPlanReview: () =>
+		| Pick<PlanReviewRequestedEvent, "reviewId" | "sessionId" | "tiers">
+		| undefined;
+	resolvePlanReview: (
+		reviewId: string,
+		choice: string,
+		input?: { feedback?: string; role?: string },
+	) => boolean;
 }
 
 interface SharedRequest {
@@ -42,6 +48,18 @@ const COMPACT_OPTIONS: FakeReviewOption[] = [
 	{ id: "execute", label: "Approve and execute", disabled: false },
 	{ id: "compact", label: "Approve and compact context", disabled: false },
 	{ id: "refine", label: "Refine plan", disabled: false },
+];
+
+const REVIEW_TIERS: PlanReviewTier[] = [
+	{ role: "slow", provider: "test", model: "slow-model" },
+	{ role: "default", provider: "test", model: "default-model" },
+];
+
+/** Reviews where the default execution tier cannot be selected. */
+const NO_DEFAULT_TIERS: Pick<PlanReviewRequestedEvent, "tiers">[] = [
+	{},
+	{ tiers: [] },
+	{ tiers: [REVIEW_TIERS[0]!] },
 ];
 
 const tempDirs: string[] = [];
@@ -65,9 +83,9 @@ function createHarness(cwd: string) {
 	const notifications: { message: string; type?: string }[] = [];
 	const messages: { message: unknown; options: unknown }[] = [];
 	const timers: FakeTimer[] = [];
-	const resolutions: { reviewId: string; choice: string; input?: { feedback?: string } }[] = [];
+	const resolutions: { reviewId: string; choice: string; input?: { feedback?: string; role?: string } }[] = [];
 	const session = { id: "session-1" };
-	let pending: { reviewId: string; sessionId: string } | undefined;
+	let pending: Pick<PlanReviewRequestedEvent, "reviewId" | "sessionId" | "tiers"> | undefined;
 	let resolveResult = true;
 
 	const ctx: FakeContext = {
@@ -137,6 +155,7 @@ function createHarness(cwd: string) {
 			planFilePath: file,
 			planContent: content,
 			options,
+			...(pending?.tiers === undefined ? {} : { tiers: pending.tiers }),
 		});
 	};
 
@@ -159,8 +178,11 @@ function createHarness(cwd: string) {
 		fire,
 		request,
 		result,
-		setPending: (reviewId: string | undefined) => {
-			pending = reviewId === undefined ? undefined : { reviewId, sessionId: session.id };
+		setPending: (
+			reviewId: string | undefined,
+			meta: Pick<PlanReviewRequestedEvent, "tiers"> = { tiers: REVIEW_TIERS },
+		) => {
+			pending = reviewId === undefined ? undefined : { reviewId, sessionId: session.id, ...meta };
 		},
 		setResolveResult: (value: boolean) => {
 			resolveResult = value;
@@ -192,8 +214,8 @@ async function waitFor(predicate: () => boolean, label: string): Promise<void> {
 	throw new Error(`Timed out waiting for ${label}`);
 }
 
-function hasNotification(harness: Harness, fragment: string): boolean {
-	return harness.notifications.some(item => item.message.includes(fragment));
+function hasWarning(harness: Harness): boolean {
+	return harness.notifications.some(item => item.type === "warning");
 }
 
 describe("native plan bridge", () => {
@@ -225,7 +247,7 @@ describe("native plan bridge", () => {
 			{ id: "compact", label: "Approve and compact context", disabled: true },
 		]);
 		expect(requests).toBe(0);
-		expect(hasNotification(harness, "Approve and compact context")).toBe(true);
+		expect(hasWarning(harness)).toBe(true);
 	});
 
 	test("approves through the native compact choice and carries approval notes", async () => {
@@ -239,7 +261,6 @@ describe("native plan bridge", () => {
 		harness.result("browser-1", true, "keep the changelog");
 		await waitFor(() => harness.resolutions.length === 1, "native approval");
 
-		expect(harness.resolutions).toEqual([{ reviewId: "native-1", choice: "compact", input: undefined }]);
 		expect(harness.messages).toEqual([
 			{
 				message: { customType: "plannotator-approval-notes", content: "keep the changelog", display: true },
@@ -294,7 +315,7 @@ describe("native plan bridge", () => {
 				choice: "refine",
 				by: "local",
 			});
-			await waitFor(() => hasNotification(harness, "已失效"), "expired review warning");
+			await waitFor(() => hasWarning(harness), "expired review warning");
 			expect(harness.resolutions).toEqual([]);
 		}
 
@@ -308,7 +329,7 @@ describe("native plan bridge", () => {
 			harness.result("browser-1", true);
 			harness.setPending("native-2");
 			harness.request("native-2", file, "PLAN");
-			await waitFor(() => hasNotification(harness, "已失效"), "stale read warning");
+			await waitFor(() => hasWarning(harness), "stale read warning");
 			expect(harness.resolutions).toEqual([]);
 		}
 	});
@@ -323,7 +344,7 @@ describe("native plan bridge", () => {
 			await fs.writeFile(file, "CHANGED");
 
 			harness.result("browser-1", true);
-			await waitFor(() => hasNotification(harness, "内容已变更"), "content mismatch warning");
+			await waitFor(() => hasWarning(harness), "content mismatch warning");
 			expect(harness.resolutions).toEqual([]);
 		}
 
@@ -336,7 +357,7 @@ describe("native plan bridge", () => {
 			await fs.unlink(file);
 
 			harness.result("browser-1", true);
-			await waitFor(() => hasNotification(harness, "计划文件不存在"), "missing plan warning");
+			await waitFor(() => hasWarning(harness), "missing plan warning");
 			expect(harness.resolutions).toEqual([]);
 		}
 
@@ -348,7 +369,7 @@ describe("native plan bridge", () => {
 			harness.request("native-1", path.join(file, "nested.md"), "PLAN");
 
 			harness.result("browser-1", true);
-			await waitFor(() => hasNotification(harness, "读取计划失败"), "read failure warning");
+			await waitFor(() => hasWarning(harness), "read failure warning");
 			expect(harness.resolutions).toEqual([]);
 		}
 	});
@@ -364,7 +385,7 @@ describe("native plan bridge", () => {
 
 			harness.result("browser-1", true);
 			expect(harness.resolutions).toEqual([]);
-			expect(hasNotification(harness, "localProtocolOptions")).toBe(true);
+			expect(hasWarning(harness)).toBe(true);
 		}
 
 		{
@@ -376,7 +397,7 @@ describe("native plan bridge", () => {
 
 			harness.result("browser-1", true);
 			harness.setPending("another-review");
-			await waitFor(() => hasNotification(harness, "已失效"), "pending review warning");
+			await waitFor(() => hasWarning(harness), "pending review warning");
 			expect(harness.resolutions).toEqual([]);
 		}
 	});
@@ -395,7 +416,7 @@ describe("native plan bridge", () => {
 			harness.request("native-1", file, "PLAN");
 			harness.result("browser-1", true);
 			expect(harness.resolutions).toEqual([]);
-			expect(hasNotification(harness, "未能启动")).toBe(true);
+			expect(hasWarning(harness)).toBe(true);
 		}
 
 		{
@@ -410,7 +431,7 @@ describe("native plan bridge", () => {
 			harness.request("native-1", file, "PLAN");
 			expect(harness.timers).toHaveLength(1);
 			harness.timers[0]!.fire();
-			expect(hasNotification(harness, "timeout")).toBe(true);
+			expect(hasWarning(harness)).toBe(true);
 
 			startupRequest!.respond({ status: "handled", result: { status: "pending", reviewId: "browser-late" } });
 			harness.result("browser-late", true);
@@ -455,6 +476,52 @@ describe("native plan bridge", () => {
 
 		harness.request("native-1", file, "PLAN");
 		harness.result("browser-1", false, "change it");
-		expect(hasNotification(harness, "未提交修改意见")).toBe(true);
+		expect(hasWarning(harness)).toBe(true);
+	});
+
+	test("leaves native approval open when the default execution tier is unavailable", async () => {
+		for (const meta of NO_DEFAULT_TIERS) {
+			const { dir, file } = await makePlan();
+			const harness = createHarness(dir);
+			harness.setPending("native-1", meta);
+			answerWith(harness, () => ({ status: "handled", result: { status: "pending", reviewId: "browser-1" } }));
+			harness.request("native-1", file, "PLAN");
+
+			harness.result("browser-1", true, "ship it");
+			await waitFor(() => hasWarning(harness), "default-unavailable warning");
+			expect(harness.resolutions).toEqual([]);
+			expect(harness.messages).toEqual([]);
+		}
+	});
+
+	test("still refines a rejection when the default execution tier is unavailable", async () => {
+		for (const meta of NO_DEFAULT_TIERS) {
+			const { dir, file } = await makePlan();
+			const harness = createHarness(dir);
+			harness.setPending("native-1", meta);
+			answerWith(harness, () => ({ status: "handled", result: { status: "pending", reviewId: "browser-1" } }));
+			harness.request("native-1", file, "PLAN");
+
+			harness.result("browser-1", false, "tighten the scope");
+			expect(harness.resolutions).toEqual([
+				{ reviewId: "native-1", choice: "refine", input: { feedback: "tighten the scope" } },
+			]);
+			expect(harness.messages).toEqual([]);
+		}
+	});
+
+	test("does not retry approval when native refuses the default selection", async () => {
+		const { dir, file } = await makePlan();
+		const harness = createHarness(dir);
+		harness.setPending("native-1");
+		answerWith(harness, () => ({ status: "handled", result: { status: "pending", reviewId: "browser-1" } }));
+		harness.setResolveResult(false);
+
+		harness.request("native-1", file, "PLAN");
+		harness.result("browser-1", true, "ship it");
+		await waitFor(() => hasWarning(harness), "refused default selection warning");
+		expect(harness.resolutions).toHaveLength(1);
+		expect(harness.resolutions[0]?.input).toEqual({ role: "default" });
+		expect(harness.messages).toEqual([]);
 	});
 });

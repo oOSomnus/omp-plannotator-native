@@ -29,7 +29,7 @@ interface SharedReviewResult {
 	feedback?: unknown;
 }
 
-const RETRY_HINT = "在原生窗口处理，或 Esc 后用 /plan-review 重新提交。";
+const RETRY_HINT = "Use the native dialog, or press Esc and resubmit with /plan-review.";
 
 export default function (pi: ExtensionAPI): void {
 	let current: PendingBrowserReview | undefined;
@@ -56,7 +56,7 @@ export default function (pi: ExtensionAPI): void {
 			supportWarned = true;
 			notify(
 				ctx,
-				"当前 omp 版本不支持原生计划审批桥接（缺少 getPendingPlanReview / resolvePlanReview），已保持原生流程。",
+				"This omp version does not support native plan review bridging (missing getPendingPlanReview / resolvePlanReview). Use the native plan review dialog.",
 			);
 		}
 		return false;
@@ -68,7 +68,7 @@ export default function (pi: ExtensionAPI): void {
 		current = undefined;
 		notify(
 			record.ctx,
-			`Plannotator 未能启动，请使用原生计划审批窗口。${detail ? ` (${detail})` : ""}`,
+			`Plannotator failed to start. Use the native plan review dialog.${detail ? ` (${detail})` : ""}`,
 		);
 	};
 
@@ -100,14 +100,19 @@ export default function (pi: ExtensionAPI): void {
 			if (!approved) {
 				if (feedback !== undefined && feedback.trim().length > 0) {
 					const accepted = ctx.resolvePlanReview(record.nativeReviewId, "refine", { feedback });
-					if (!accepted) notify(ctx, `原生计划审阅已失效，未提交修改意见。${RETRY_HINT}`);
+					if (!accepted) {
+						notify(ctx, `The native plan review is no longer pending; feedback was not submitted. ${RETRY_HINT}`);
+					}
 				}
 				// Rejected without feedback: leave the native review untouched.
 				return;
 			}
 
 			if (ctx.localProtocolOptions === undefined) {
-				notify(ctx, `缺少 local:// 协议上下文（localProtocolOptions），未自动批准。${RETRY_HINT}`);
+				notify(
+					ctx,
+					`Missing local:// context (localProtocolOptions); the plan was not automatically approved. ${RETRY_HINT}`,
+				);
 				return;
 			}
 
@@ -119,27 +124,27 @@ export default function (pi: ExtensionAPI): void {
 				});
 			} catch (error) {
 				const detail = error instanceof Error ? error.message : String(error);
-				notify(ctx, `读取计划失败（${detail}），未自动批准。${RETRY_HINT}`);
+				notify(ctx, `Failed to read the plan (${detail}); the plan was not automatically approved. ${RETRY_HINT}`);
 				return;
 			}
 
 			if (content === null) {
-				notify(ctx, `计划文件不存在，未自动批准。${RETRY_HINT}`);
+				notify(ctx, `The plan file does not exist; the plan was not automatically approved. ${RETRY_HINT}`);
 				return;
 			}
 			if (content !== record.planContent) {
-				notify(ctx, `计划文件内容已变更，未自动批准。${RETRY_HINT}`);
+				notify(ctx, `The plan file has changed; the plan was not automatically approved. ${RETRY_HINT}`);
 				return;
 			}
 
 			// Re-check after the read; no await between these checks and the call.
 			// shortcut: native overlay edits are not exposed by the hook API; require core support before allowing concurrent editors.
 			if (current !== record) {
-				notify(ctx, `原生计划审阅已失效，未自动批准。${RETRY_HINT}`);
+				notify(ctx, `The native plan review is no longer pending; the plan was not automatically approved. ${RETRY_HINT}`);
 				return;
 			}
 			if (ctx.sessionManager.getSessionId() !== record.sessionId) {
-				notify(ctx, `会话已切换，未自动批准。${RETRY_HINT}`);
+				notify(ctx, `The session has changed; the plan was not automatically approved. ${RETRY_HINT}`);
 				return;
 			}
 			const pending = ctx.getPendingPlanReview();
@@ -148,13 +153,24 @@ export default function (pi: ExtensionAPI): void {
 				pending.reviewId !== record.nativeReviewId ||
 				pending.sessionId !== record.sessionId
 			) {
-				notify(ctx, `原生计划审阅已失效，未自动批准。${RETRY_HINT}`);
+				notify(ctx, `The native plan review is no longer pending; the plan was not automatically approved. ${RETRY_HINT}`);
 				return;
 			}
 
-			const accepted = ctx.resolvePlanReview(record.nativeReviewId, "compact");
+			if (!pending.tiers?.some(tier => tier.role === "default")) {
+				notify(
+					ctx,
+					`The default execution model is not selectable in this review; the plan was not automatically approved. ${RETRY_HINT}`,
+				);
+				return;
+			}
+
+			const accepted = ctx.resolvePlanReview(record.nativeReviewId, "compact", { role: "default" });
 			if (!accepted) {
-				notify(ctx, `原生计划审阅已失效，未自动批准。${RETRY_HINT}`);
+				notify(
+					ctx,
+					`The native plan review is no longer pending or the default execution model is unavailable; the plan was not automatically approved. ${RETRY_HINT}`,
+				);
 				return;
 			}
 			if (feedback !== undefined && feedback.trim().length > 0) {
@@ -165,12 +181,12 @@ export default function (pi: ExtensionAPI): void {
 					);
 				} catch (error) {
 					const detail = error instanceof Error ? error.message : String(error);
-					notify(ctx, `计划已批准，但附言发送失败（${detail}）。`);
+					notify(ctx, `The plan was approved, but approval notes could not be sent (${detail}).`);
 				}
 			}
 		} catch (error) {
 			const detail = error instanceof Error ? error.message : String(error);
-			notify(ctx, `桥接批准失败（${detail}）。${RETRY_HINT}`);
+			notify(ctx, `Plan approval bridging failed (${detail}). ${RETRY_HINT}`);
 		}
 	};
 
@@ -178,7 +194,7 @@ export default function (pi: ExtensionAPI): void {
 		if (ctx.agent.kind !== "main" || ctx.mode !== "tui" || !ctx.hasUI) return;
 		if (!supportsNativeReview(ctx)) return;
 		if (!event.options.some(option => option.id === "compact" && !option.disabled)) {
-			notify(ctx, `当前计划审阅没有可用的 “Approve and compact context”，请使用原生计划审批窗口。`);
+			notify(ctx, `This review does not offer "Approve and compact context". Use the native plan review dialog.`);
 			return;
 		}
 		if (current?.nativeReviewId === event.reviewId) return;
@@ -231,7 +247,7 @@ export default function (pi: ExtensionAPI): void {
 		record.timer = ctx.setTimeout(() => {
 			if (current !== record) return;
 			current = undefined;
-			notify(ctx, "Plannotator 未能启动，请使用原生计划审批窗口。 (timeout)");
+			notify(ctx, "Plannotator failed to start. Use the native plan review dialog. (timeout)");
 		}, START_TIMEOUT_MS);
 
 		try {
